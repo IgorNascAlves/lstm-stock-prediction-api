@@ -1,3 +1,15 @@
+# .gitignore
+.vscode
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.env
+venv/
+.DS_Store
+# *.keras
+# *.pkl
+# *.joblib
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
