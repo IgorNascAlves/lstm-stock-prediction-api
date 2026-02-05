@@ -62,6 +62,9 @@ def predict_stock(request: PredictionRequest):
     # Garante que é datetime
     df['Date'] = pd.to_datetime(df['Date'])
     
+    # Transformação do volume
+    df['Volume'] = np.log1p(df['Volume'])
+
     # Pega os últimos 60 dias
     last_60_days = df.iloc[-60:]
     
