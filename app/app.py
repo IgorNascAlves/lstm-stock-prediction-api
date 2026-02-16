@@ -1,16 +1,71 @@
 # Arquivo: app/app.py
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+from prometheus_client import make_asgi_app, Counter, Histogram, Gauge
 import numpy as np
 import joblib
 import tensorflow as tf
 import yfinance as yf
 import pandas as pd
 import os
+import time
+import psutil  # Biblioteca para medir CPU e RAM
 
+# --- INICIALIZAÇÃO DA API ---
 app = FastAPI(title="API Predictor WEGE3 - Tech Challenge 4")
 
-# --- CONFIGURAÇÃO ---
+# --- CONFIGURAÇÃO DE MONITORAMENTO (PROMETHEUS) ---
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
+
+# 1. Métrica de Desempenho (Tempo de Resposta)
+REQUEST_LATENCY = Histogram(
+    "app_request_latency_seconds", 
+    "Tempo de resposta da API em segundos", 
+    ["endpoint"]
+)
+
+# 2. Métrica de Volume (Contador de Requisições)
+REQUEST_COUNT = Counter(
+    "app_request_count_total", 
+    "Total de requisições à API", 
+    ["method", "endpoint", "status"]
+)
+
+# 3. Métrica de Recursos (CPU e RAM) - Gauge (Valor que sobe e desce)
+SYSTEM_CPU_USAGE = Gauge("app_system_cpu_usage_percent", "Uso de CPU do sistema (%)")
+APP_RAM_USAGE = Gauge("app_memory_usage_bytes", "Uso de Memória RAM da aplicação (bytes)")
+
+# Middleware: Executado em TODA requisição para atualizar as métricas
+@app.middleware("http")
+async def monitor_requests(request: Request, call_next):
+    start_time = time.time()
+    
+    # Processa a requisição
+    response = await call_next(request)
+    
+    process_time = time.time() - start_time
+    
+    # Ignora a rota de métricas para não gerar ruído
+    if request.url.path != "/metrics":
+        # Atualiza latência e contagem
+        REQUEST_LATENCY.labels(endpoint=request.url.path).observe(process_time)
+        REQUEST_COUNT.labels(
+            method=request.method, 
+            endpoint=request.url.path, 
+            status=response.status_code
+        ).inc()
+        
+        # Atualiza métricas de recursos (Utilização de Recursos)
+        # Pega o consumo de memória do processo atual
+        process = psutil.Process(os.getpid())
+        APP_RAM_USAGE.set(process.memory_info().rss)
+        # Pega o uso de CPU (intervalo=None para não bloquear a chamada)
+        SYSTEM_CPU_USAGE.set(psutil.cpu_percent(interval=None))
+    
+    return response
+
+# --- CONFIGURAÇÃO DO MODELO ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, '../models/modelo_lstm.keras')
 SCALER_PATH = os.path.join(BASE_DIR, '../models/scaler.joblib')
@@ -24,29 +79,27 @@ try:
 except Exception as e:
     print(f"❌ Erro ao carregar modelo/scaler: {e}")
 
+# --- MODELOS DE DADOS ---
 class PredictionRequest(BaseModel):
     ticker: str
 
-# Função auxiliar para limpar números que vêm do Pandas/Numpy
 def to_float(valor):
     if hasattr(valor, 'item'):
         return float(valor.item())
     return float(valor)
 
+# --- ROTAS DA API ---
 @app.post("/predict")
 def predict_stock(request: PredictionRequest):
-    # 1. Trava de Segurança
+    # Trava de Segurança
     if request.ticker.upper() != TICKER_ALVO:
         raise HTTPException(
             status_code=400, 
             detail=f"Este modelo é exclusivo para {TICKER_ALVO}. Você enviou: {request.ticker}"
         )
 
-    print(f"📥 Baixando dados recentes para {TICKER_ALVO}...")
-
     # 2. Baixar dados
     try:
-        # reset_index traz a data para uma coluna normal
         df = yf.download(TICKER_ALVO, period="6mo", progress=False).reset_index()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro no Yahoo Finance: {str(e)}")
@@ -54,18 +107,12 @@ def predict_stock(request: PredictionRequest):
     if len(df) < 60:
         raise HTTPException(status_code=400, detail="Histórico insuficiente.")
 
-    # 3. Tratamento de Data e Colunas
-    # Se o yfinance trouxe a data como 'index', renomeia para 'Date'
+    # 3. Tratamento
     if 'Date' not in df.columns and 'index' in df.columns:
         df.rename(columns={'index': 'Date'}, inplace=True)
     
-    # Garante que é datetime
     df['Date'] = pd.to_datetime(df['Date'])
-    
-    # Transformação do volume
     df['Volume'] = np.log1p(df['Volume'])
-
-    # Pega os últimos 60 dias
     last_60_days = df.iloc[-60:]
     
     try:
@@ -79,20 +126,13 @@ def predict_stock(request: PredictionRequest):
         input_reshaped = input_scaled.reshape(1, 60, 5)
         prediction_scaled = model.predict(input_reshaped)
         
-        # Inverter normalização
         dummy = np.zeros((1, 5))
         dummy[:, 3] = prediction_scaled[0, 0]
         prediction_final = scaler.inverse_transform(dummy)[0, 3]
 
-        # --- EXTRAÇÃO SEGURA DOS VALORES ---
-        # Pegamos o último fechamento real
         fechamento_anterior_bruto = last_60_days['Close'].iloc[-1]
-        
-        # Usamos a função auxiliar para garantir que virou número Python
         fechamento_real = to_float(fechamento_anterior_bruto)
         previsao_real = to_float(prediction_final)
-        
-        # Pega a data de referência
         data_ref = last_60_days['Date'].iloc[-1].date()
 
     except Exception as e:
@@ -105,3 +145,7 @@ def predict_stock(request: PredictionRequest):
         "fechamento_anterior": round(fechamento_real, 2),
         "previsao_para_amanha": round(previsao_real, 2)
     }
+
+@app.get("/")
+def home():
+    return {"message": "API Online. Acesse /docs para testar ou /metrics para monitoramento."}
